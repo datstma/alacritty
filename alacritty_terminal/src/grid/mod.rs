@@ -135,6 +135,14 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Number of lines that scrolled off the top of the screen, minus lines pulled back
+    /// from history by resizing.
+    ///
+    /// Clearing the history does not reset it, so `scrolled_lines() + line` numbers the
+    /// rows of a terminal session absolutely, even after the oldest history is dropped.
+    #[cfg_attr(feature = "serde", serde(default))]
+    scrolled_lines: u64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -147,6 +155,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            scrolled_lines: 0,
         }
     }
 
@@ -270,6 +279,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
+            self.scrolled_lines += positions as u64;
+
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
 
@@ -431,6 +442,16 @@ impl<T> Grid<T> {
     #[inline]
     pub fn display_offset(&self) -> usize {
         self.display_offset
+    }
+
+    /// Absolute number of the topmost screen line: how many lines scrolled off the top of
+    /// the screen, minus lines pulled back from history by resizing.
+    ///
+    /// Reflowing to a different column count can rewrap lines that are already in
+    /// history, so lines inside history may shift relative to this number on resize.
+    #[inline]
+    pub fn scrolled_lines(&self) -> u64 {
+        self.scrolled_lines
     }
 
     #[inline]

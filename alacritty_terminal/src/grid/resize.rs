@@ -25,11 +25,17 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             Ordering::Equal => (),
         }
 
+        // Reflow can move lines between the screen and history.
+        let history_before = self.history_size() as u64;
+
         match self.columns.cmp(&columns) {
             Ordering::Less => self.grow_columns(reflow, columns),
             Ordering::Greater => self.shrink_columns(reflow, columns),
             Ordering::Equal => (),
         }
+
+        let history_after = self.history_size() as u64;
+        self.scrolled_lines = (self.scrolled_lines + history_after).saturating_sub(history_before);
 
         // Restore template cell.
         self.cursor.template = template;
@@ -46,6 +52,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         D: PartialEq,
     {
         let lines_added = target - self.lines;
+        let scrolled_before = self.scrolled_lines;
 
         // Need to resize before updating buffer.
         self.raw.grow_visible_lines(target);
@@ -66,6 +73,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         self.display_offset = self.display_offset.saturating_sub(lines_added);
         self.decrease_scroll_limit(lines_added);
+
+        // Only lines pulled back from history move the top of the screen.
+        self.scrolled_lines = scrolled_before.saturating_sub(from_history as u64);
     }
 
     /// Remove lines from the visible area.

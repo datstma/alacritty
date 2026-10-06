@@ -161,6 +161,67 @@ fn test_iter() {
     assert_indexed(23, final_iter.prev());
 }
 
+// Scrolled lines count lines leaving the top of the screen, and survive history limits.
+#[test]
+fn scrolled_lines_scroll_and_resize_lines() {
+    let mut grid = Grid::<Cell>::new(3, 5, 2);
+    assert_eq!(grid.scrolled_lines(), 0);
+
+    // Only scrolling a region that starts at the top moves lines off the screen.
+    grid.scroll_up(&(Line(0)..Line(3)), 1);
+    grid.scroll_up(&(Line(1)..Line(3)), 1);
+    assert_eq!(grid.scrolled_lines(), 1);
+
+    // Lines dropped from full history are still counted.
+    grid.scroll_up(&(Line(0)..Line(3)), 4);
+    assert_eq!(grid.history_size(), 2);
+    assert_eq!(grid.scrolled_lines(), 5);
+
+    // Growing pulls one line back from history.
+    grid.resize(true, 4, 5);
+    assert_eq!(grid.history_size(), 1);
+    assert_eq!(grid.scrolled_lines(), 4);
+
+    // Shrinking below the cursor scrolls it up again.
+    grid.cursor.point.line = Line(3);
+    grid.resize(true, 3, 5);
+    assert_eq!(grid.scrolled_lines(), 5);
+
+    // Clearing history keeps the numbering.
+    grid.clear_history();
+    assert_eq!(grid.scrolled_lines(), 5);
+}
+
+// Reflow moves wrapped lines between the screen and history without renumbering them.
+#[test]
+fn scrolled_lines_reflow() {
+    // Absolute number of the row starting with '1'.
+    fn first_row(grid: &Grid<Cell>) -> i64 {
+        let history = grid.history_size() as i32;
+        let line = (-history..grid.screen_lines() as i32)
+            .map(Line)
+            .find(|&line| grid[line][Column(0)] == cell('1'))
+            .unwrap();
+        grid.scrolled_lines() as i64 + line.0 as i64
+    }
+
+    let mut grid = Grid::<Cell>::new(1, 5, 2);
+    for (i, c) in "12345".chars().enumerate() {
+        grid[Line(0)][Column(i)] = cell(c);
+    }
+    assert_eq!(first_row(&grid), 0);
+
+    // "12" and "34" move into history; the screen shows "5".
+    grid.resize(true, 1, 2);
+    assert_eq!(grid.history_size(), 2);
+    assert_eq!(grid.scrolled_lines(), 2);
+    assert_eq!(first_row(&grid), 0);
+
+    // Joining the line again keeps its number.
+    grid.resize(true, 1, 5);
+    assert_eq!(first_row(&grid), 0);
+}
+
 #[test]
 fn shrink_reflow() {
     let mut grid = Grid::<Cell>::new(1, 5, 2);
