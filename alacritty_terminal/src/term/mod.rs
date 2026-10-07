@@ -1454,6 +1454,11 @@ impl<T: EventListener> Handler for Term<T> {
             self.grid.cursor.point.line += 1;
             self.damage_cursor();
         }
+
+        // In line feed/new line mode (LNM), LF, VT and FF also return the carriage.
+        if self.mode.contains(TermMode::LINE_FEED_NEW_LINE) {
+            self.carriage_return();
+        }
     }
 
     /// Set current position as a tabstop.
@@ -1781,8 +1786,8 @@ impl<T: EventListener> Handler for Term<T> {
             ansi::ClearMode::Above => {
                 let cursor = self.grid.cursor.point;
 
-                // If clearing more than one line.
-                if cursor.line > 1 {
+                // If the cursor isn't on the first line, clear all lines above it.
+                if cursor.line > 0 {
                     // Fully clear all lines before the current line.
                     self.grid.reset_region(..cursor.line);
                 }
@@ -3364,6 +3369,26 @@ mod tests {
         let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
         parser.advance(&mut term, b"\x1b[5;10r");
         assert_eq!(*term.scroll_region(), Line(4)..Line(10));
+    }
+
+    #[test]
+    fn conformance_fixes_from_esctest() {
+        let size = TermSize::new(10, 6);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
+        let row = |term: &Term<VoidListener>, line: i32| -> String {
+            (0..10).map(|col| term.grid()[Line(line)][Column(col)].c).collect()
+        };
+
+        // ED 1 clears every line above the cursor, also from the second line.
+        parser.advance(&mut term, b"aaaaa\r\nbbbbb\x1b[2;3H\x1b[1J");
+        assert_eq!(row(&term, 0), " ".repeat(10));
+        assert_eq!(row(&term, 1), "   bb     ");
+
+        // In LNM, LF also returns the carriage.
+        parser.advance(&mut term, b"\x1b[20h\x1b[3;5H\n");
+        assert_eq!(term.grid().cursor.point, Point::new(Line(3), Column(0)));
+        parser.advance(&mut term, b"\x1b[20l");
     }
 
     #[test]
