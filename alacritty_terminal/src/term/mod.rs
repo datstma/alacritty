@@ -1350,7 +1350,13 @@ impl<T: EventListener> Handler for Term<T> {
             },
             6 => {
                 let pos = self.grid.cursor.point;
-                let text = format!("\x1b[{};{}R", pos.line + 1, pos.column + 1);
+                // In origin mode, lines count from the top of the scrolling region.
+                let line = if self.mode.contains(TermMode::ORIGIN) {
+                    pos.line - self.scroll_region.start
+                } else {
+                    pos.line
+                };
+                let text = format!("\x1b[{};{}R", line + 1, pos.column + 1);
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             _ => debug!("unknown device status query: {arg}"),
@@ -3316,6 +3322,32 @@ mod tests {
         term.swap_alt();
         let expected = KeyboardModes::DISAMBIGUATE_ESC_CODES | KeyboardModes::REPORT_EVENT_TYPES;
         assert_eq!(kitty(&term), TermMode::from(expected));
+    }
+
+    #[test]
+    fn cursor_position_report_follows_origin_mode() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Clone, Default)]
+        struct Writes(Rc<RefCell<Vec<String>>>);
+        impl EventListener for Writes {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(text) = event {
+                    self.0.borrow_mut().push(text);
+                }
+            }
+        }
+
+        let writes = Writes::default();
+        let size = TermSize::new(20, 24);
+        let mut term = Term::new(Config::default(), &size, writes.clone());
+        let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
+        // A region from line 5 to 10, origin mode, then row 3 of the region.
+        parser.advance(&mut term, b"\x1b[5;10r\x1b[?6h\x1b[3;1H\x1b[6n");
+        // Without origin mode, the same place is line 7 of the screen.
+        parser.advance(&mut term, b"\x1b[?6l\x1b[7;1H\x1b[6n");
+        assert_eq!(*writes.0.borrow(), vec!["\x1b[3;1R".to_owned(), "\x1b[7;1R".to_owned()]);
     }
 
     #[test]
