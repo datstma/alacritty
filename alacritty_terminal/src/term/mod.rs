@@ -716,6 +716,13 @@ impl<T> Term<T> {
         &self.scroll_region
     }
 
+    /// The primary screen's grid, also while the alternate screen is shown (when it's the
+    /// inactive one). Its history reflows on resize either way.
+    #[inline]
+    pub fn primary_grid(&self) -> &Grid<Cell> {
+        if self.mode.contains(TermMode::ALT_SCREEN) { &self.inactive_grid } else { &self.grid }
+    }
+
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
