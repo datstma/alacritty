@@ -710,6 +710,12 @@ impl<T> Term<T> {
         &self.mode
     }
 
+    /// The scrolling region (DECSTBM): its first line and the line after its last.
+    #[inline]
+    pub fn scroll_region(&self) -> &Range<Line> {
+        &self.scroll_region
+    }
+
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
@@ -3348,6 +3354,16 @@ mod tests {
         // Without origin mode, the same place is line 7 of the screen.
         parser.advance(&mut term, b"\x1b[?6l\x1b[7;1H\x1b[6n");
         assert_eq!(*writes.0.borrow(), vec!["\x1b[3;1R".to_owned(), "\x1b[7;1R".to_owned()]);
+    }
+
+    #[test]
+    fn scroll_region_is_readable() {
+        let size = TermSize::new(20, 24);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        assert_eq!(*term.scroll_region(), Line(0)..Line(24));
+        let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
+        parser.advance(&mut term, b"\x1b[5;10r");
+        assert_eq!(*term.scroll_region(), Line(4)..Line(10));
     }
 
     #[test]
