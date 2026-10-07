@@ -1325,7 +1325,19 @@ impl<T: EventListener> Handler for Term<T> {
             return;
         }
 
-        self.set_keyboard_mode(mode.into(), apply);
+        // Change the flags at the top of the stack, so reports, pops and switching
+        // screens see the change; with an empty stack, the flags become its first entry.
+        let current = self.keyboard_mode_stack.last().copied().unwrap_or(KeyboardModes::NO_MODE);
+        let new_mode = match apply {
+            KeyboardModesApplyBehavior::Replace => mode,
+            KeyboardModesApplyBehavior::Union => current.union(mode),
+            KeyboardModesApplyBehavior::Difference => current.difference(mode),
+        };
+        match self.keyboard_mode_stack.last_mut() {
+            Some(top) => *top = new_mode,
+            None => self.keyboard_mode_stack.push(new_mode),
+        }
+        self.set_keyboard_mode(new_mode.into(), KeyboardModesApplyBehavior::Replace);
     }
 
     #[inline]
@@ -3263,6 +3275,47 @@ mod tests {
 
         // The title stack is not affected.
         assert!(term.title_stack.is_empty());
+    }
+
+    #[test]
+    fn set_keyboard_mode_changes_the_top_of_the_stack() {
+        let size = TermSize::new(7, 17);
+        let config = Config { kitty_keyboard: true, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        let kitty = |term: &Term<VoidListener>| term.mode & TermMode::KITTY_KEYBOARD_PROTOCOL;
+
+        // With an empty stack, setting creates its first entry.
+        Handler::set_keyboard_mode(
+            &mut term,
+            KeyboardModes::DISAMBIGUATE_ESC_CODES,
+            KeyboardModesApplyBehavior::Replace,
+        );
+        assert_eq!(term.keyboard_mode_stack, vec![KeyboardModes::DISAMBIGUATE_ESC_CODES]);
+
+        // Setting after a push changes the pushed entry, which a pop then removes.
+        Handler::push_keyboard_mode(&mut term, KeyboardModes::REPORT_EVENT_TYPES);
+        Handler::set_keyboard_mode(
+            &mut term,
+            KeyboardModes::REPORT_ALL_KEYS_AS_ESC,
+            KeyboardModesApplyBehavior::Union,
+        );
+        let both = KeyboardModes::REPORT_EVENT_TYPES | KeyboardModes::REPORT_ALL_KEYS_AS_ESC;
+        assert_eq!(term.keyboard_mode_stack.last(), Some(&both));
+        assert_eq!(kitty(&term), TermMode::from(both));
+        Handler::pop_keyboard_modes(&mut term, 1);
+        assert_eq!(kitty(&term), TermMode::from(KeyboardModes::DISAMBIGUATE_ESC_CODES));
+
+        // The change survives a trip to the alternate screen and back.
+        Handler::set_keyboard_mode(
+            &mut term,
+            KeyboardModes::REPORT_EVENT_TYPES,
+            KeyboardModesApplyBehavior::Union,
+        );
+        term.swap_alt();
+        assert_eq!(kitty(&term), TermMode::empty());
+        term.swap_alt();
+        let expected = KeyboardModes::DISAMBIGUATE_ESC_CODES | KeyboardModes::REPORT_EVENT_TYPES;
+        assert_eq!(kitty(&term), TermMode::from(expected));
     }
 
     #[test]
