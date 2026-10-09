@@ -77,6 +77,9 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        /// Grapheme cluster mode (2027): an emoji with a skin tone, a ZWJ sequence or a
+        /// flag takes one character's cells.
+        const GRAPHEME_CLUSTER        = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -322,6 +325,12 @@ pub struct Term<T> {
     /// Currently inactive keyboard mode stack.
     inactive_keyboard_mode_stack: Vec<KeyboardModes>,
 
+    /// Grapheme cluster mode (2027) when no program has set it, on the primary screen.
+    grapheme_default: bool,
+
+    /// Grapheme cluster mode as a program last set it, which wins over the default.
+    grapheme_program: Option<bool>,
+
     /// Information about damaged cells.
     damage: TermDamageState,
 
@@ -432,6 +441,8 @@ impl<T> Term<T> {
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
             keyboard_mode_stack: Default::default(),
+            grapheme_default: false,
+            grapheme_program: None,
             active_charset: Default::default(),
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
@@ -723,6 +734,97 @@ impl<T> Term<T> {
         if self.mode.contains(TermMode::ALT_SCREEN) { &self.inactive_grid } else { &self.grid }
     }
 
+    /// Sets grapheme cluster mode (2027) for when no program has set it. It applies to the
+    /// primary screen; the alternate screen has it only when a program sets it there.
+    #[inline]
+    pub fn set_grapheme_default(&mut self, on: bool) {
+        self.grapheme_default = on;
+        self.update_grapheme_mode();
+    }
+
+    /// Grapheme cluster mode as a program last set it with DECSET or DECRST 2027.
+    #[inline]
+    pub fn grapheme_program(&self) -> Option<bool> {
+        self.grapheme_program
+    }
+
+    /// Replaces a program's setting of grapheme cluster mode; `None` forgets it.
+    #[inline]
+    pub fn set_grapheme_program(&mut self, on: Option<bool>) {
+        self.grapheme_program = on;
+        self.update_grapheme_mode();
+    }
+
+    fn update_grapheme_mode(&mut self) {
+        let alternate = self.mode.contains(TermMode::ALT_SCREEN);
+        let on = self.grapheme_program.unwrap_or(self.grapheme_default && !alternate);
+        self.mode.set(TermMode::GRAPHEME_CLUSTER, on);
+    }
+
+    /// Joins `c` to the grapheme cluster in the cell before the cursor when it continues an
+    /// emoji there: a skin tone, the second regional indicator of a flag, an emoji after a
+    /// zero-width joiner, variation selector 16 and the keycap mark. A cluster that becomes
+    /// an emoji widens to two cells. Returns whether it joined.
+    fn join_grapheme(&mut self, c: char) -> bool {
+        let line = self.grid.cursor.point.line;
+        let mut column = self.grid.cursor.point.column;
+        if !self.grid.cursor.input_needs_wrap {
+            if column.0 == 0 {
+                return false;
+            }
+            column.0 -= 1;
+        }
+        if self.grid[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            if column.0 == 0 {
+                return false;
+            }
+            column.0 -= 1;
+        }
+        let cell = &self.grid[line][column];
+        let base = cell.c;
+        let extra = cell.zerowidth().unwrap_or(&[]);
+        let last = extra.last().copied().unwrap_or(base);
+        let joins = match c {
+            // Long clusters stay as they are (zalgo text).
+            _ if extra.len() >= 16 => false,
+            '\u{1f3fb}'..='\u{1f3ff}' => pictographic(last),
+            // The second regional indicator of a flag; a third starts a new one.
+            c if regional_indicator(c) => regional_indicator(base) && extra.is_empty(),
+            '\u{fe0f}' => pictographic(last) || keycap_base(base) && extra.is_empty(),
+            '\u{20e3}' => keycap_base(base),
+            _ => last == '\u{200d}' && pictographic(c) && pictographic(base),
+        };
+        if !joins {
+            return false;
+        }
+        self.grid[line][column].push_zerowidth(c);
+        if !self.grid[line][column].flags.contains(Flags::WIDE_CHAR) {
+            self.widen_cluster(line, column);
+        }
+        true
+    }
+
+    /// Makes the narrow cell at `column` a wide one, its spacer after it, and puts the
+    /// cursor past both. A cell in the last column stays narrow.
+    fn widen_cluster(&mut self, line: Line, column: Column) {
+        let columns = self.columns();
+        if column.0 + 1 >= columns {
+            return;
+        }
+        self.grid[line][column].flags.insert(Flags::WIDE_CHAR);
+        let mut spacer = self.grid.cursor.template.clone();
+        spacer.c = ' ';
+        spacer.flags.insert(Flags::WIDE_CHAR_SPACER);
+        self.grid[line][Column(column.0 + 1)] = spacer;
+        if column.0 + 2 < columns {
+            self.grid.cursor.point.column = Column(column.0 + 2);
+            self.grid.cursor.input_needs_wrap = false;
+        } else {
+            self.grid.cursor.point.column = Column(columns - 1);
+            self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
@@ -743,6 +845,7 @@ impl<T> Term<T> {
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
+        self.update_grapheme_mode();
         self.selection = None;
         self.mark_fully_damaged();
     }
@@ -1073,6 +1176,13 @@ impl<T: EventListener> Handler for Term<T> {
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
+        // In grapheme cluster mode, a character that continues the cluster before the
+        // cursor joins its cell.
+        if self.mode.contains(TermMode::GRAPHEME_CLUSTER) && c > '\u{2ff}' && self.join_grapheme(c)
+        {
+            return;
+        }
+
         // Number of cells the char will occupy.
         let width = match c.width() {
             Some(width) => width,
@@ -1888,6 +1998,8 @@ impl<T: EventListener> Handler for Term<T> {
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
         self.mode.insert(TermMode::default());
+        self.grapheme_program = None;
+        self.update_grapheme_mode();
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
         self.mark_fully_damaged();
@@ -1970,6 +2082,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(2027) => {
+                self.set_grapheme_program(Some(true));
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2033,6 +2149,10 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(2027) => {
+                self.set_grapheme_program(Some(false));
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2120,6 +2240,7 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
+            PrivateMode::Unknown(2027) => self.mode.contains(TermMode::GRAPHEME_CLUSTER).into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -2538,6 +2659,26 @@ pub mod test {
 
         term
     }
+}
+
+/// Regional indicator symbols, two of which make a flag.
+fn regional_indicator(c: char) -> bool {
+    ('\u{1f1e6}'..='\u{1f1ff}').contains(&c)
+}
+
+/// The characters a keycap sequence starts with.
+fn keycap_base(c: char) -> bool {
+    c.is_ascii_digit() || c == '#' || c == '*'
+}
+
+/// Emoji and pictographs (Unicode's Extended_Pictographic, approximated by its blocks).
+fn pictographic(c: char) -> bool {
+    matches!(c,
+        '\u{a9}' | '\u{ae}' | '\u{203c}' | '\u{2049}' | '\u{2122}' | '\u{2139}'
+        | '\u{2194}'..='\u{21aa}' | '\u{231a}'..='\u{23ff}' | '\u{24c2}'
+        | '\u{25aa}'..='\u{27bf}' | '\u{2934}'..='\u{2935}' | '\u{2b05}'..='\u{2b55}'
+        | '\u{3030}' | '\u{303d}' | '\u{3297}' | '\u{3299}' | '\u{1f000}'..='\u{1faff}')
+        && !regional_indicator(c)
 }
 
 #[cfg(test)]
@@ -3454,4 +3595,84 @@ mod tests {
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
     }
+
+    #[test]
+    fn grapheme_clusters_take_one_characters_cells() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
+        let cluster = |term: &Term<VoidListener>, column: usize| {
+            let cell = &term.grid()[Line(0)][Column(column)];
+            let mut text = cell.c.to_string();
+            text.extend(cell.zerowidth().unwrap_or(&[]));
+            (text, cell.flags.contains(Flags::WIDE_CHAR))
+        };
+        let cursor = |term: &Term<VoidListener>| term.grid().cursor.point.column.0;
+
+        // Off by default: each code point takes its own width.
+        parser.advance(&mut term, "\u{1f44d}\u{1f3fd}".as_bytes());
+        assert_eq!(cursor(&term), 4);
+
+        // On: a skin tone, a family and a flag each take two cells.
+        for (text, base) in [
+            ("\u{1f44d}\u{1f3fd}", '\u{1f44d}'),
+            ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", '\u{1f468}'),
+            ("\u{1f1f8}\u{1f1ea}", '\u{1f1f8}'),
+            ("\u{2764}\u{fe0f}", '\u{2764}'),
+            ("1\u{fe0f}\u{20e3}", '1'),
+            ("\u{261d}\u{1f3fd}", '\u{261d}'),
+        ] {
+            parser.advance(&mut term, b"\x1b[2J\x1b[H\x1b[?2027h");
+            parser.advance(&mut term, text.as_bytes());
+            assert_eq!(cursor(&term), 2, "{text:?}");
+            assert_eq!(cluster(&term, 0), (text.to_owned(), true), "{text:?}");
+            assert_eq!(term.grid()[Line(0)][Column(0)].c, base);
+            parser.advance(&mut term, b"x");
+            assert_eq!(term.grid()[Line(0)][Column(2)].c, 'x', "{text:?}");
+        }
+
+        // Two flags are two clusters; text after a joiner isn't joined.
+        parser.advance(&mut term, b"\x1b[2J\x1b[H");
+        parser.advance(&mut term, "\u{1f1f8}\u{1f1ea}\u{1f1eb}\u{1f1ee}".as_bytes());
+        assert_eq!(cursor(&term), 4);
+        parser.advance(&mut term, b"\x1b[2J\x1b[H");
+        parser.advance(&mut term, "a\u{200d}b".as_bytes());
+        assert_eq!(cursor(&term), 2);
+
+        // DECRQM reports it; DECRST turns it off.
+        assert_eq!(term.grapheme_program(), Some(true));
+        parser.advance(&mut term, b"\x1b[?2027l");
+        assert_eq!(term.grapheme_program(), Some(false));
+        assert!(!term.mode().contains(TermMode::GRAPHEME_CLUSTER));
+    }
+
+    #[test]
+    fn grapheme_cluster_default_is_for_the_primary_screen() {
+        let size = TermSize::new(10, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: crate::vte::ansi::Processor = crate::vte::ansi::Processor::new();
+        term.set_grapheme_default(true);
+        assert!(term.mode().contains(TermMode::GRAPHEME_CLUSTER));
+        parser.advance(&mut term, b"\x1b[?1049h");
+        assert!(!term.mode().contains(TermMode::GRAPHEME_CLUSTER));
+        parser.advance(&mut term, b"\x1b[?2027h");
+        assert!(term.mode().contains(TermMode::GRAPHEME_CLUSTER));
+        parser.advance(&mut term, b"\x1b[?1049l");
+        assert!(term.mode().contains(TermMode::GRAPHEME_CLUSTER));
+        term.set_grapheme_program(None);
+        term.set_grapheme_default(false);
+        assert!(!term.mode().contains(TermMode::GRAPHEME_CLUSTER));
+
+        // A cluster at the end of a line stays in its cell.
+        term.set_grapheme_default(true);
+        parser.advance(&mut term, b"\x1b[1;10H");
+        parser.advance(&mut term, "\u{1f1f8}\u{1f1ea}".as_bytes());
+        assert_eq!(term.grid()[Line(0)][Column(9)].c, '\u{1f1f8}');
+        assert_eq!(term.grid().cursor.point.line, Line(0));
+        // A full reset forgets a program's setting.
+        parser.advance(&mut term, b"\x1b[?2027l\x1bc");
+        assert_eq!(term.grapheme_program(), None);
+        assert!(term.mode().contains(TermMode::GRAPHEME_CLUSTER));
+    }
+
 }
